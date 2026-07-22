@@ -26,3 +26,6 @@ prisma/dev.db-journal
 # AI editor settings
 .claude/
 .agents/
+
+
+my_notes.md
