@@ -13,6 +13,7 @@ Built as a backend engineering assignment (Indigold), with an emphasis on clean 
 - [Local Setup](#local-setup)
 - [API Reference](#api-reference)
 - [Testing](#testing)
+- [Scalability & Reliability](#scalability--reliability)
 - [Troubleshooting / Known Local-Dev Quirks](#troubleshooting--known-local-dev-quirks)
 - [Class Diagram](#class-diagram)
 - [ER Diagram](#er-diagram)
@@ -73,6 +74,10 @@ src/
     notification.service.ts      # the routing/preference "brain"
     notification.schema.ts       # Zod request schema
     notification.repository.ts   # audit log writes + history reads
+  queue/
+    notification.queue.ts        # job data shape + injectable enqueue function
+    queue-connection.ts          # real BullMQ/Redis wiring (used by the API)
+    notification.worker.ts       # worker process entrypoint + job processor
   app.ts                         # Express app assembly (no listen())
   server.ts                      # entrypoint, calls app.listen()
 prisma/
@@ -98,13 +103,14 @@ docker-entrypoint.sh             # runs migrate deploy + seed before starting th
 | Security / logging middleware | helmet, cors, morgan |
 | Dev tooling | tsx (dev/build-free run), `tsc` (typecheck + production build) |
 | Tests | Vitest + Supertest |
-| Containerization | Docker + Docker Compose (app + Postgres, one-command local setup) |
+| Containerization | Docker + Docker Compose (app + Postgres + Redis + worker, one-command local setup) |
+| Async dispatch | BullMQ + Redis (queue + worker), with graceful synchronous fallback |
 
 ## Local Setup
 
 ### Option A — Docker Compose (recommended)
 
-One command gets you the API, its database, migrations, and seed data — no Node, Postgres, or Prisma CLI needed on your host.
+One command gets you the whole stack — API, database, Redis, and the background worker — no Node, Postgres, Redis, or Prisma CLI needed on your host.
 
 **Prerequisite:** Docker Desktop (or another Docker Compose-compatible engine).
 
@@ -112,17 +118,17 @@ One command gets you the API, its database, migrations, and seed data — no Nod
 docker compose up --build
 ```
 
-This builds the app image, starts a real `postgres:16` container, waits for it to be healthy, then applies the committed migration and seeds sample data automatically before the server starts. The API is live at `http://localhost:3000`:
+This starts four containers: `postgres`, `redis`, `app` (waits for both to be healthy, then applies the committed migration and seeds sample data automatically before the server starts), and `worker` (consumes queued notification jobs in the background). The API is live at `http://localhost:3000`:
 
 ```bash
 curl http://localhost:3000/health
 ```
 
-The seeded users' ids are printed in the `app` container's logs (`docker compose logs app`) — copy one for the API examples below. Stop everything with `docker compose down` (add `-v` to also drop the Postgres volume and start fresh next time).
+The seeded users' ids are printed in the `app` container's logs (`docker compose logs app`) — copy one for the API examples below. Stop everything with `docker compose down` (add `-v` to also drop the Postgres/Redis volumes and start fresh next time). Scale the worker independently of the API if you want to see that in action: `docker compose up --scale worker=3 -d`.
 
 ### Option B — Run natively on the host
 
-Useful for active development (hot reload via `tsx watch`). You still need a Postgres instance — the simplest way is to start just the `postgres` service from Docker Compose and run the app on the host against it:
+Useful for active development (hot reload via `tsx watch`). You still need a Postgres instance — the simplest way is to start just the `postgres` service from Docker Compose and run the app on the host against it (add `redis` too, and uncomment `REDIS_URL` in `.env`, if you also want to exercise the async queue path natively — otherwise notifications just dispatch synchronously, which is perfectly fine for local development):
 
 ```bash
 docker compose up -d postgres
@@ -175,6 +181,12 @@ The server listens on `http://localhost:3000` by default (`PORT` in `.env` to ch
 curl http://localhost:3000/health
 ```
 
+If you enabled `REDIS_URL`, also run the worker in a separate terminal so queued jobs actually get processed:
+
+```bash
+npm run worker
+```
+
 ### Prerequisites (Option B only)
 
 - Node.js 20.19+ (developed against Node 22)
@@ -186,34 +198,46 @@ All examples assume `<USER_ID>` is a real id from your seed output (step 4 above
 
 ### `POST /api/notifications`
 
-Dispatches a notification across the requested channels, respecting the user's preferences.
+Dispatches a notification across the requested channels, respecting the user's preferences. The user is checked synchronously (a bad id still fails fast with `404`), but the actual dispatch work happens one of two ways — see [Scalability & Reliability](#scalability--reliability):
 
-**Successful dispatch:**
+- **Redis is reachable** (the default when running via `docker compose up`) — the request is handed to a background queue and the API responds immediately:
 
-```bash
-curl -X POST http://localhost:3000/api/notifications \
-  -H "Content-Type: application/json" \
-  -d '{
+  ```bash
+  curl -X POST http://localhost:3000/api/notifications \
+    -H "Content-Type: application/json" \
+    -d '{
+      "userId": "<USER_ID>",
+      "title": "Order Shipped",
+      "body": "Your order is on its way",
+      "channels": ["EMAIL", "SMS", "PUSH", "IN_APP"]
+    }'
+  ```
+
+  ```json
+  {
     "userId": "<USER_ID>",
-    "title": "Order Shipped",
-    "body": "Your order is on its way",
-    "channels": ["EMAIL", "SMS", "PUSH", "IN_APP"]
-  }'
-```
+    "status": "queued",
+    "jobId": "42"
+  }
+  ```
 
-```json
-{
-  "userId": "<USER_ID>",
-  "results": [
-    { "channel": "EMAIL", "status": "SUCCESS" },
-    { "channel": "SMS", "status": "SUCCESS" },
-    { "channel": "PUSH", "status": "SUCCESS" },
-    { "channel": "IN_APP", "status": "SUCCESS" }
-  ]
-}
-```
+  The actual per-channel outcome shows up shortly after in `GET /:userId/history` (usually within milliseconds — a worker is typically already idle and waiting).
 
-**Opted-out channel** (use the seeded Bob, who has `smsEnabled: false`) — the channel is skipped, not silently dropped:
+- **No Redis configured, or Redis is unreachable** — the exact same request dispatches synchronously instead, and the response carries the per-channel results directly (this is also what you'll see if you run the app natively without ever starting Redis):
+
+  ```json
+  {
+    "userId": "<USER_ID>",
+    "results": [
+      { "channel": "EMAIL", "status": "SUCCESS" },
+      { "channel": "SMS", "status": "SUCCESS" },
+      { "channel": "PUSH", "status": "SUCCESS" },
+      { "channel": "IN_APP", "status": "SUCCESS" }
+    ]
+  }
+  ```
+
+**Opted-out channel** (use the seeded Bob, who has `smsEnabled: false`) — the channel is skipped, not silently dropped. Shown here in the synchronous response shape; the queued path skips it the same way, just visible in the history endpoint instead of the immediate response:
 
 ```json
 {
@@ -294,10 +318,42 @@ npm run test:watch
 
 Tests are split by what they need:
 
-- **`tests/unit/`** — pure logic, no database. The routing/preference service and the provider registry are tested with injected fakes.
-- **`tests/integration/`** — Supertest against the real Express app and the real Postgres database, exercising the full request/response cycle.
+- **`tests/unit/`** — pure logic, no database, no Redis. The routing/preference service, the provider registry, and the queue producer/worker are all tested with injected fakes.
+- **`tests/integration/`** — Supertest (and, for the queue, real BullMQ) against the real Express app, the real Postgres database, and — for one dedicated file — a real Redis.
 
-DB-touching tests share the local dev database rather than a separate test instance — each test creates and tears down its own fixture user, which gives real isolation without adding another moving part on top of an already-fragile local database (see below). `NODE_ENV=test` is set automatically by the test config, which also turns off the simulated random provider failures so results stay deterministic.
+DB-touching tests share one Postgres instance rather than a separate test database — each test creates and tears down its own fixture user, which gives real isolation without adding another moving part. `NODE_ENV=test` is set automatically by the test config, which also turns off the simulated random provider failures so results stay deterministic.
+
+`tests/integration/notification-queue.test.ts` is the one file that needs Redis — it checks connectivity up front and **skips itself (not fails)** if Redis isn't reachable, so a plain `npm test` with no Redis running still passes cleanly (every other test exercises the synchronous fallback path instead, which is the same code path that runs whenever Redis is unavailable in production, too). Start Redis first to actually exercise it:
+
+```bash
+docker compose up -d redis
+npm test
+```
+
+## Scalability & Reliability
+
+`POST /api/notifications` doesn't dispatch synchronously by default — it hands the work to a queue (BullMQ, backed by Redis) and a separate worker process picks it up:
+
+```mermaid
+flowchart LR
+    Client -->|POST| API[API — validates, checks user, enqueues]
+    API -->|202 queued| Client
+    API -->|job| Redis[(Redis / BullMQ queue)]
+    Redis --> Worker1[Worker]
+    Redis --> Worker2[Worker N...]
+    Worker1 --> Dispatch[NotificationService.dispatch<br/>same code the sync path uses]
+    Worker2 --> Dispatch
+    Dispatch --> DB[(PostgreSQL — history)]
+```
+
+**Why:** the four channel providers are the slowest, least reliable part of this system by design (each simulates real-world latency and a ~10% failure rate). Making the caller wait for all of them, synchronously, on the request path means one slow/failing channel directly hurts the API's response time — and a burst of requests turns into a burst of concurrent outbound calls with no ceiling. Queueing decouples "acknowledge the request" from "do the slow, unreliable part":
+
+- **Faster, more predictable API responses** — `202` comes back as soon as the job is queued, regardless of channel latency.
+- **Automatic retries** — each job gets 3 attempts with exponential backoff, so a transient provider failure (the kind Phase 9 already simulates) gets a real second chance instead of being logged as failed and forgotten.
+- **Backpressure instead of overload** — a burst of requests queues up and drains at a sustainable rate instead of spawning unbounded concurrent work.
+- **Independent horizontal scaling** — `docker-compose.yml`'s `worker` service can be scaled (`docker compose up --scale worker=3`) without touching the API at all, since the queue is the only thing they share.
+
+**Graceful degradation, not a hard dependency:** if `REDIS_URL` isn't set, or Redis is unreachable when a request comes in, the API doesn't error out — it falls back to dispatching synchronously in-process, the exact same way this endpoint worked before the queue existed (see the two response shapes in the [API Reference](#post-apinotifications) above). The producer connection intentionally does **not** keep retrying a dead Redis (see `src/queue/queue-connection.ts`) — that's a deliberate choice to fail fast so one HTTP request never hangs waiting on a Redis reconnect; the trade-off is that if Redis comes back later, that specific running `app` process stays on the synchronous path until it restarts, rather than silently switching back mid-flight. The worker process, by contrast, is configured to keep retrying its Redis connection indefinitely — its whole job is to sit and wait, so giving up isn't the right default there.
 
 ## Troubleshooting / Known Local-Dev Quirks
 
@@ -342,10 +398,18 @@ classDiagram
         +logAttempt(input) void
         +getHistoryForUser(userId) NotificationLogEntry[]
     }
+    class NotificationQueue {
+        +enqueueNotification(data) jobId
+    }
+    class NotificationWorker {
+        +createJobProcessor(service) JobProcessor
+    }
 
     NotificationController --> NotificationService
-    NotificationController --> UserRepository : existence check for history
+    NotificationController --> UserRepository : existence check (404 fast-fail)
     NotificationController --> NotificationRepository : reads history
+    NotificationController --> NotificationQueue : enqueues, or falls back to direct dispatch
+    NotificationWorker --> NotificationService : same dispatch() the sync path uses
     NotificationService --> UserRepository
     NotificationService --> ProviderRegistry
     NotificationService --> NotificationRepository : logs every outcome
@@ -357,6 +421,8 @@ classDiagram
 ```
 
 `ChannelProvider` is the Strategy pattern: four interchangeable implementations behind one interface, selected at runtime by `ProviderRegistry`. Swapping a mock for a real integration (e.g. Twilio for SMS) means implementing the interface and registering it — nothing else in the system changes.
+
+`NotificationController` and `NotificationWorker` both drive `NotificationService.dispatch()` — the exact same method, whether it's called synchronously on the request path or asynchronously from a queued job. Only the caller differs; the routing/preference/logging logic has no idea which one invoked it. See [Scalability & Reliability](#scalability--reliability) for why both paths exist.
 
 ## ER Diagram
 

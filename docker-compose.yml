@@ -16,11 +16,25 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   app:
     build: .
     restart: unless-stopped
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/notification_service
+      REDIS_URL: redis://redis:6379
       PORT: 3000
       NODE_ENV: production
     ports:
@@ -28,6 +42,26 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    restart: unless-stopped
+    entrypoint: []
+    command: ["node", "dist/src/queue/notification.worker.js"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/notification_service
+      REDIS_URL: redis://redis:6379
+      NODE_ENV: production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      app:
+        condition: service_started
 
 volumes:
   postgres_data:
+  redis_data:

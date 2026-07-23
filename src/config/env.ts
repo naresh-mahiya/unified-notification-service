@@ -12,4 +12,7 @@ export const env = {
   port: Number(process.env.PORT ?? 3000),
   nodeEnv: process.env.NODE_ENV ?? "development",
   databaseUrl: required("DATABASE_URL"),
+  // Optional by design: without it, notifications dispatch synchronously instead of
+  // through the queue (see src/queue/queue-connection.ts).
+  redisUrl: process.env.REDIS_URL,
 };
