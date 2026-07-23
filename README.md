@@ -8,15 +8,15 @@ Built as a backend engineering assignment (Indigold), with an emphasis on clean 
 
 - [Features](#features)
 - [Architecture](#architecture)
+- [Class Diagram](#class-diagram)
+- [ER Diagram](#er-diagram)
+- [Scalability & Reliability](#scalability--reliability)
 - [Project Structure](#project-structure)
 - [Tech Stack](#tech-stack)
 - [Local Setup](#local-setup)
 - [API Reference](#api-reference)
 - [Testing](#testing)
-- [Scalability & Reliability](#scalability--reliability)
 - [Troubleshooting / Known Local-Dev Quirks](#troubleshooting--known-local-dev-quirks)
-- [Class Diagram](#class-diagram)
-- [ER Diagram](#er-diagram)
 
 ## Features
 
@@ -47,6 +47,127 @@ flowchart LR
 ```
 
 The core rule: **`NotificationService` never talks to Express or Prisma directly.** It receives plain data, applies the preference/routing rules, and delegates I/O to injected repository/provider functions. That's what makes the routing logic fully unit-testable with fakes, no database required — see [`tests/unit/notification.service.test.ts`](tests/unit/notification.service.test.ts).
+
+## Class Diagram
+
+```mermaid
+classDiagram
+    class NotificationController {
+        +createNotification(req, res)
+        +getNotificationHistory(req, res)
+    }
+    class NotificationService {
+        -getUserWithPreferences
+        -getProvider
+        -logAttempt
+        +dispatch(userId, title, body, channels) DispatchResult
+    }
+    class ChannelProvider {
+        <<interface>>
+        +send(notification) DeliveryResult
+    }
+    class EmailProvider
+    class SmsProvider
+    class PushProvider
+    class InAppProvider
+    class ProviderRegistry {
+        +getProvider(channel) ChannelProvider
+    }
+    class UserRepository {
+        +getUserWithPreferences(userId) UserWithPreferences
+    }
+    class NotificationRepository {
+        +logAttempt(input) void
+        +getHistoryForUser(userId) NotificationLogEntry[]
+    }
+    class NotificationQueue {
+        +enqueueNotification(data) jobId
+    }
+    class NotificationWorker {
+        +createJobProcessor(service) JobProcessor
+    }
+
+    NotificationController --> NotificationService
+    NotificationController --> UserRepository : existence check (404 fast-fail)
+    NotificationController --> NotificationRepository : reads history
+    NotificationController --> NotificationQueue : enqueues, or falls back to direct dispatch
+    NotificationWorker --> NotificationService : same dispatch() the sync path uses
+    NotificationService --> UserRepository
+    NotificationService --> ProviderRegistry
+    NotificationService --> NotificationRepository : logs every outcome
+    ProviderRegistry --> ChannelProvider
+    ChannelProvider <|.. EmailProvider
+    ChannelProvider <|.. SmsProvider
+    ChannelProvider <|.. PushProvider
+    ChannelProvider <|.. InAppProvider
+```
+
+`ChannelProvider` is the Strategy pattern: four interchangeable implementations behind one interface, selected at runtime by `ProviderRegistry`. Swapping a mock for a real integration (e.g. Twilio for SMS) means implementing the interface and registering it — nothing else in the system changes.
+
+`NotificationController` and `NotificationWorker` both drive `NotificationService.dispatch()` — the exact same method, whether it's called synchronously on the request path or asynchronously from a queued job. Only the caller differs; the routing/preference/logging logic has no idea which one invoked it. See [Scalability & Reliability](#scalability--reliability) for why both paths exist.
+
+## ER Diagram
+
+```mermaid
+erDiagram
+    USER ||--o| NOTIFICATION_PREFERENCE : has
+    USER ||--o{ NOTIFICATION_LOG : has
+
+    USER {
+        string id PK
+        string name
+        string email UK
+        datetime createdAt
+        datetime updatedAt
+    }
+    NOTIFICATION_PREFERENCE {
+        string id PK
+        string userId FK
+        boolean emailEnabled
+        boolean smsEnabled
+        boolean pushEnabled
+        boolean inAppEnabled
+        datetime createdAt
+        datetime updatedAt
+    }
+    NOTIFICATION_LOG {
+        string id PK
+        string userId FK
+        string channel
+        string status
+        string title
+        string body
+        string errorMessage "nullable"
+        datetime createdAt
+    }
+```
+
+`NotificationPreference` is a 1:1 relation kept as its own table (rather than columns on `User`) so identity and preferences stay separate concerns. `NotificationLog` gets one row per channel per dispatch attempt — including skipped ones — so the audit trail can actually prove preference enforcement is working, not just record successful sends.
+
+## Scalability & Reliability
+
+`POST /api/notifications` doesn't dispatch synchronously by default — it hands the work to a queue (BullMQ, backed by Redis) and a separate worker process picks it up:
+
+```mermaid
+flowchart LR
+    Client -->|POST| API[API — validates, checks user, enqueues]
+    API -->|202 queued| Client
+    API -->|job| Redis[(Redis / BullMQ queue)]
+    Redis --> Worker1[Worker]
+    Redis --> Worker2[Worker N...]
+    Worker1 --> Dispatch[NotificationService.dispatch<br/>same code the sync path uses]
+    Worker2 --> Dispatch
+    Dispatch --> DB[(PostgreSQL — history)]
+```
+
+**Why:** the four channel providers are the slowest, least reliable part of this system by design (each simulates real-world latency and a ~10% failure rate). Making the caller wait for all of them, synchronously, on the request path means one slow/failing channel directly hurts the API's response time — and a burst of requests turns into a burst of concurrent outbound calls with no ceiling. Queueing decouples "acknowledge the request" from "do the slow, unreliable part":
+
+- **Faster, more predictable API responses** — `202` comes back as soon as the job is queued, regardless of channel latency.
+- **Automatic retries** — each job gets 3 attempts with exponential backoff, so a transient provider failure (the kind Phase 9 already simulates) gets a real second chance instead of being logged as failed and forgotten.
+- **Backpressure instead of overload** — a burst of requests queues up and drains at a sustainable rate instead of spawning unbounded concurrent work.
+- **Independent horizontal scaling** — `docker-compose.yml`'s `worker` service can be scaled (`docker compose up --scale worker=3`) without touching the API at all, since the queue is the only thing they share.
+
+**Graceful degradation, not a hard dependency:** if `REDIS_URL` isn't set, or Redis is unreachable when a request comes in, the API doesn't error out — it falls back to dispatching synchronously in-process, the exact same way this endpoint worked before the queue existed (see the two response shapes in the [API Reference](#post-apinotifications) below). The producer connection intentionally does **not** keep retrying a dead Redis (see `src/queue/queue-connection.ts`) — that's a deliberate choice to fail fast so one HTTP request never hangs waiting on a Redis reconnect; the trade-off is that if Redis comes back later, that specific running `app` process stays on the synchronous path until it restarts, rather than silently switching back mid-flight. The worker process, by contrast, is configured to keep retrying its Redis connection indefinitely — its whole job is to sit and wait, so giving up isn't the right default there.
 
 ## Project Structure
 
@@ -194,7 +315,7 @@ npm run worker
 
 ## API Reference
 
-All examples assume `<USER_ID>` is a real id from your seed output (step 4 above).
+All examples assume `<USER_ID>` is a real id from your seed output (step 4 above). Every example below is a plain `curl` command — each one can also be pasted directly into Postman's "raw" request body / URL fields as-is, so no separate Postman collection is needed to use either tool.
 
 ### `POST /api/notifications`
 
@@ -330,31 +451,6 @@ docker compose up -d redis
 npm test
 ```
 
-## Scalability & Reliability
-
-`POST /api/notifications` doesn't dispatch synchronously by default — it hands the work to a queue (BullMQ, backed by Redis) and a separate worker process picks it up:
-
-```mermaid
-flowchart LR
-    Client -->|POST| API[API — validates, checks user, enqueues]
-    API -->|202 queued| Client
-    API -->|job| Redis[(Redis / BullMQ queue)]
-    Redis --> Worker1[Worker]
-    Redis --> Worker2[Worker N...]
-    Worker1 --> Dispatch[NotificationService.dispatch<br/>same code the sync path uses]
-    Worker2 --> Dispatch
-    Dispatch --> DB[(PostgreSQL — history)]
-```
-
-**Why:** the four channel providers are the slowest, least reliable part of this system by design (each simulates real-world latency and a ~10% failure rate). Making the caller wait for all of them, synchronously, on the request path means one slow/failing channel directly hurts the API's response time — and a burst of requests turns into a burst of concurrent outbound calls with no ceiling. Queueing decouples "acknowledge the request" from "do the slow, unreliable part":
-
-- **Faster, more predictable API responses** — `202` comes back as soon as the job is queued, regardless of channel latency.
-- **Automatic retries** — each job gets 3 attempts with exponential backoff, so a transient provider failure (the kind Phase 9 already simulates) gets a real second chance instead of being logged as failed and forgotten.
-- **Backpressure instead of overload** — a burst of requests queues up and drains at a sustainable rate instead of spawning unbounded concurrent work.
-- **Independent horizontal scaling** — `docker-compose.yml`'s `worker` service can be scaled (`docker compose up --scale worker=3`) without touching the API at all, since the queue is the only thing they share.
-
-**Graceful degradation, not a hard dependency:** if `REDIS_URL` isn't set, or Redis is unreachable when a request comes in, the API doesn't error out — it falls back to dispatching synchronously in-process, the exact same way this endpoint worked before the queue existed (see the two response shapes in the [API Reference](#post-apinotifications) above). The producer connection intentionally does **not** keep retrying a dead Redis (see `src/queue/queue-connection.ts`) — that's a deliberate choice to fail fast so one HTTP request never hangs waiting on a Redis reconnect; the trade-off is that if Redis comes back later, that specific running `app` process stays on the synchronous path until it restarts, rather than silently switching back mid-flight. The worker process, by contrast, is configured to keep retrying its Redis connection indefinitely — its whole job is to sit and wait, so giving up isn't the right default there.
-
 ## Troubleshooting / Known Local-Dev Quirks
 
 - **Occasional `FAILED` results while manually testing** — this is intentional, not a bug. Each provider simulates a ~10% random failure rate outside the test environment, so the failure-path logging is actually exercised. It's disabled automatically for `npm test`.
@@ -365,99 +461,3 @@ flowchart LR
 Earlier iterations of local setup used `npx prisma dev` — Prisma's embedded local Postgres emulator. It's convenient (zero external services to install) but turned out to have real, reproducible rough edges during development: it needed `NODE_OPTIONS=--experimental-sqlite` on some Node versions, exposed two different connection strings for CLI vs. app use (a common source of confusing `Connection terminated unexpectedly` errors), and its background WAL-streaming subsystem would periodically crash-loop under sustained use, degrading an otherwise-working session.
 
 None of this was an application bug — reproduced identically in a completely fresh clone with fresh `node_modules`. The actual fix was to stop working around a dev-only emulator and use a real `postgres:16` container instead (see [Local Setup](#local-setup)), which has none of these failure modes and also let the app collapse back down to a single `DATABASE_URL` (the two-URL split only existed because of `prisma dev`'s proxy). Kept here as a documented lesson rather than deleted, since diagnosing "is this an infra problem or a code problem" was itself a real part of building this.
-
-## Class Diagram
-
-```mermaid
-classDiagram
-    class NotificationController {
-        +createNotification(req, res)
-        +getNotificationHistory(req, res)
-    }
-    class NotificationService {
-        -getUserWithPreferences
-        -getProvider
-        -logAttempt
-        +dispatch(userId, title, body, channels) DispatchResult
-    }
-    class ChannelProvider {
-        <<interface>>
-        +send(notification) DeliveryResult
-    }
-    class EmailProvider
-    class SmsProvider
-    class PushProvider
-    class InAppProvider
-    class ProviderRegistry {
-        +getProvider(channel) ChannelProvider
-    }
-    class UserRepository {
-        +getUserWithPreferences(userId) UserWithPreferences
-    }
-    class NotificationRepository {
-        +logAttempt(input) void
-        +getHistoryForUser(userId) NotificationLogEntry[]
-    }
-    class NotificationQueue {
-        +enqueueNotification(data) jobId
-    }
-    class NotificationWorker {
-        +createJobProcessor(service) JobProcessor
-    }
-
-    NotificationController --> NotificationService
-    NotificationController --> UserRepository : existence check (404 fast-fail)
-    NotificationController --> NotificationRepository : reads history
-    NotificationController --> NotificationQueue : enqueues, or falls back to direct dispatch
-    NotificationWorker --> NotificationService : same dispatch() the sync path uses
-    NotificationService --> UserRepository
-    NotificationService --> ProviderRegistry
-    NotificationService --> NotificationRepository : logs every outcome
-    ProviderRegistry --> ChannelProvider
-    ChannelProvider <|.. EmailProvider
-    ChannelProvider <|.. SmsProvider
-    ChannelProvider <|.. PushProvider
-    ChannelProvider <|.. InAppProvider
-```
-
-`ChannelProvider` is the Strategy pattern: four interchangeable implementations behind one interface, selected at runtime by `ProviderRegistry`. Swapping a mock for a real integration (e.g. Twilio for SMS) means implementing the interface and registering it — nothing else in the system changes.
-
-`NotificationController` and `NotificationWorker` both drive `NotificationService.dispatch()` — the exact same method, whether it's called synchronously on the request path or asynchronously from a queued job. Only the caller differs; the routing/preference/logging logic has no idea which one invoked it. See [Scalability & Reliability](#scalability--reliability) for why both paths exist.
-
-## ER Diagram
-
-```mermaid
-erDiagram
-    USER ||--o| NOTIFICATION_PREFERENCE : has
-    USER ||--o{ NOTIFICATION_LOG : has
-
-    USER {
-        string id PK
-        string name
-        string email UK
-        datetime createdAt
-        datetime updatedAt
-    }
-    NOTIFICATION_PREFERENCE {
-        string id PK
-        string userId FK
-        boolean emailEnabled
-        boolean smsEnabled
-        boolean pushEnabled
-        boolean inAppEnabled
-        datetime createdAt
-        datetime updatedAt
-    }
-    NOTIFICATION_LOG {
-        string id PK
-        string userId FK
-        string channel
-        string status
-        string title
-        string body
-        string errorMessage "nullable"
-        datetime createdAt
-    }
-```
-
-`NotificationPreference` is a 1:1 relation kept as its own table (rather than columns on `User`) so identity and preferences stay separate concerns. `NotificationLog` gets one row per channel per dispatch attempt — including skipped ones — so the audit trail can actually prove preference enforcement is working, not just record successful sends.
