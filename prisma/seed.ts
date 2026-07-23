@@ -1,52 +1,38 @@
 import { prisma } from "../src/db/prisma.js";
 
+const users = [
+  {
+    name: "Alice Johnson",
+    email: "alice@example.com",
+    preferences: { emailEnabled: true, smsEnabled: true, pushEnabled: true, inAppEnabled: true },
+  },
+  {
+    name: "Bob Smith",
+    email: "bob@example.com",
+    preferences: { emailEnabled: true, smsEnabled: false, pushEnabled: true, inAppEnabled: true },
+  },
+  {
+    name: "Priya Nair",
+    email: "priya@example.com",
+    preferences: { emailEnabled: false, smsEnabled: false, pushEnabled: false, inAppEnabled: true },
+  },
+];
+
 async function main() {
-  await prisma.user.create({
-    data: {
-      name: "Alice Johnson",
-      email: "alice@example.com",
-      preference: {
-        create: {
-          emailEnabled: true,
-          smsEnabled: true,
-          pushEnabled: true,
-          inAppEnabled: true,
-        },
-      },
-    },
-  });
+  console.log("Seeding users...\n");
 
-  await prisma.user.create({
-    data: {
-      name: "Bob Smith",
-      email: "bob@example.com",
-      preference: {
-        create: {
-          emailEnabled: true,
-          smsEnabled: false,
-          pushEnabled: true,
-          inAppEnabled: true,
-        },
-      },
-    },
-  });
+  for (const { name, email, preferences } of users) {
+    const user = await prisma.user.upsert({
+      where: { email },
+      update: { name, preference: { upsert: { create: preferences, update: preferences } } },
+      create: { name, email, preference: { create: preferences } },
+    });
 
-  await prisma.user.create({
-    data: {
-      name: "Priya Nair",
-      email: "priya@example.com",
-      preference: {
-        create: {
-          emailEnabled: false,
-          smsEnabled: false,
-          pushEnabled: false,
-          inAppEnabled: true,
-        },
-      },
-    },
-  });
+    console.log(`${user.name.padEnd(15)} id=${user.id}  email=${user.email}`);
+    console.log(`  preferences: ${JSON.stringify(preferences)}\n`);
+  }
 
-  console.log("Seed complete: 3 users created.");
+  console.log("Seed complete. Use one of the ids above as `userId` in the API examples below.");
 }
 
 main()
