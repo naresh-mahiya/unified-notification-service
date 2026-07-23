@@ -14,6 +14,8 @@ describe("provider registry", () => {
     expect(getProvider(Channel.IN_APP)).toBeInstanceOf(InAppProvider);
   });
 
+  // The registry forces a 0% failure rate under NODE_ENV=test (see provider-registry.ts),
+  // so this stays deterministic even though the real providers simulate random failures.
   it("every provider resolves with a successful delivery result", async () => {
     const notification = { userId: "user-1", title: "Hi", body: "World" };
 
@@ -22,4 +24,30 @@ describe("provider registry", () => {
       expect(result).toEqual({ success: true });
     }
   });
+});
+
+describe("provider failure simulation", () => {
+  const providerClasses = [
+    { name: "EmailProvider", Provider: EmailProvider },
+    { name: "SmsProvider", Provider: SmsProvider },
+    { name: "PushProvider", Provider: PushProvider },
+    { name: "InAppProvider", Provider: InAppProvider },
+  ];
+
+  it.each(providerClasses)("$name always succeeds when constructed with a 0% failure rate", async ({ Provider }) => {
+    const provider = new Provider(0);
+    const result = await provider.send({ userId: "user-1", title: "Hi", body: "World" });
+    expect(result).toEqual({ success: true });
+  });
+
+  it.each(providerClasses)(
+    "$name always fails with a descriptive error when constructed with a 100% failure rate",
+    async ({ Provider }) => {
+      const provider = new Provider(1);
+      const result = await provider.send({ userId: "user-1", title: "Hi", body: "World" });
+      expect(result.success).toBe(false);
+      expect(result.error).toEqual(expect.any(String));
+      expect(result.error!.length).toBeGreaterThan(0);
+    }
+  );
 });

@@ -43,6 +43,35 @@ describe("POST /api/notifications", () => {
     });
   });
 
+  it("returns 201 with an all-SKIPPED result when every requested channel is opted out", async () => {
+    const res = await request(app).post("/api/notifications").send({
+      userId: testUserId,
+      title: "Welcome",
+      body: "Thanks for signing up",
+      channels: ["SMS"],
+    });
+
+    expect(res.status).toBe(201);
+    expect(res.body).toEqual({
+      userId: testUserId,
+      results: [{ channel: "SMS", status: "SKIPPED" }],
+    });
+  });
+
+  it("rejects a payload containing an unknown channel value", async () => {
+    const res = await request(app).post("/api/notifications").send({
+      userId: testUserId,
+      title: "Welcome",
+      body: "Thanks for signing up",
+      channels: ["FAX"],
+    });
+
+    expect(res.status).toBe(400);
+    expect(res.body.details).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "channels.0" })])
+    );
+  });
+
   it("rejects a payload missing title", async () => {
     const res = await request(app)
       .post("/api/notifications")

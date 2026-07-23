@@ -7,5 +7,10 @@ export default defineConfig({
     // opens multiple concurrent connection pools against it, which this local dev DB doesn't
     // handle reliably. Serializing keeps the suite deterministic.
     fileParallelism: false,
+    // Forces the provider registry's simulated random failures off (see provider-registry.ts)
+    // so dispatch outcomes stay deterministic in tests.
+    env: {
+      NODE_ENV: "test",
+    },
   },
 });

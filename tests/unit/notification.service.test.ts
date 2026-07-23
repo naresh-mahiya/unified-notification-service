@@ -140,6 +140,27 @@ describe("NotificationService.dispatch", () => {
     );
   });
 
+  it("returns all SKIPPED results (no error) when the user has opted out of every requested channel", async () => {
+    const user = fakeUser({ emailEnabled: false, smsEnabled: false });
+    const emailProvider = successProvider();
+    const smsProvider = successProvider();
+
+    const service = new NotificationService(
+      async () => user,
+      (channel) => (channel === Channel.EMAIL ? emailProvider : smsProvider),
+      fakeLogAttempt()
+    );
+
+    const result = await service.dispatch(user.id, "Hi", "Body", [Channel.EMAIL, Channel.SMS]);
+
+    expect(result.results).toEqual([
+      { channel: Channel.EMAIL, status: "SKIPPED" },
+      { channel: Channel.SMS, status: "SKIPPED" },
+    ]);
+    expect(emailProvider.send).not.toHaveBeenCalled();
+    expect(smsProvider.send).not.toHaveBeenCalled();
+  });
+
   it("throws a 404 AppError when the user does not exist, without logging anything", async () => {
     const logAttempt = fakeLogAttempt();
     const service = new NotificationService(
