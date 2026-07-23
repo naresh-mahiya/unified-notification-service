@@ -89,6 +89,77 @@ describe("NotificationService.dispatch", () => {
     );
   });
 
+  it("dispatches successfully to all four channels when the user has opted into everything", async () => {
+    const user = fakeUser();
+    const providers: Record<Channel, ChannelProvider> = {
+      [Channel.EMAIL]: successProvider(),
+      [Channel.SMS]: successProvider(),
+      [Channel.PUSH]: successProvider(),
+      [Channel.IN_APP]: successProvider(),
+    };
+
+    const service = new NotificationService(
+      async () => user,
+      (channel) => providers[channel],
+      fakeLogAttempt()
+    );
+
+    const result = await service.dispatch(user.id, "Hi", "Body", [
+      Channel.EMAIL,
+      Channel.SMS,
+      Channel.PUSH,
+      Channel.IN_APP,
+    ]);
+
+    expect(result.results).toEqual([
+      { channel: Channel.EMAIL, status: "SUCCESS" },
+      { channel: Channel.SMS, status: "SUCCESS" },
+      { channel: Channel.PUSH, status: "SUCCESS" },
+      { channel: Channel.IN_APP, status: "SUCCESS" },
+    ]);
+    for (const provider of Object.values(providers)) {
+      expect(provider.send).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("skips all four channels, calling no provider, when the user has opted out of everything", async () => {
+    const user = fakeUser({
+      emailEnabled: false,
+      smsEnabled: false,
+      pushEnabled: false,
+      inAppEnabled: false,
+    });
+    const providers: Record<Channel, ChannelProvider> = {
+      [Channel.EMAIL]: successProvider(),
+      [Channel.SMS]: successProvider(),
+      [Channel.PUSH]: successProvider(),
+      [Channel.IN_APP]: successProvider(),
+    };
+
+    const service = new NotificationService(
+      async () => user,
+      (channel) => providers[channel],
+      fakeLogAttempt()
+    );
+
+    const result = await service.dispatch(user.id, "Hi", "Body", [
+      Channel.EMAIL,
+      Channel.SMS,
+      Channel.PUSH,
+      Channel.IN_APP,
+    ]);
+
+    expect(result.results).toEqual([
+      { channel: Channel.EMAIL, status: "SKIPPED" },
+      { channel: Channel.SMS, status: "SKIPPED" },
+      { channel: Channel.PUSH, status: "SKIPPED" },
+      { channel: Channel.IN_APP, status: "SKIPPED" },
+    ]);
+    for (const provider of Object.values(providers)) {
+      expect(provider.send).not.toHaveBeenCalled();
+    }
+  });
+
   it("does not let one failing provider block the others, and logs the failure with its error", async () => {
     const user = fakeUser();
     const failingEmailProvider: ChannelProvider = {
