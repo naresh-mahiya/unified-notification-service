@@ -82,6 +82,9 @@ prisma/
 tests/
   unit/                          # no DB — fakes/mocks only
   integration/                   # real Express app + real Postgres
+Dockerfile                       # multi-stage build (deps -> build -> slim runtime)
+docker-compose.yml               # app + postgres, one-command local setup
+docker-entrypoint.sh             # runs migrate deploy + seed before starting the server
 ```
 
 ## Tech Stack
@@ -95,46 +98,51 @@ tests/
 | Security / logging middleware | helmet, cors, morgan |
 | Dev tooling | tsx (dev/build-free run), `tsc` (typecheck + production build) |
 | Tests | Vitest + Supertest |
+| Containerization | Docker + Docker Compose (app + Postgres, one-command local setup) |
 
 ## Local Setup
 
-### Prerequisites
+### Option A — Docker Compose (recommended)
 
-- Node.js 20.19+ (developed against Node 22)
-- npm
+One command gets you the API, its database, migrations, and seed data — no Node, Postgres, or Prisma CLI needed on your host.
 
-### 1. Install dependencies
+**Prerequisite:** Docker Desktop (or another Docker Compose-compatible engine).
+
+```bash
+docker compose up --build
+```
+
+This builds the app image, starts a real `postgres:16` container, waits for it to be healthy, then applies the committed migration and seeds sample data automatically before the server starts. The API is live at `http://localhost:3000`:
+
+```bash
+curl http://localhost:3000/health
+```
+
+The seeded users' ids are printed in the `app` container's logs (`docker compose logs app`) — copy one for the API examples below. Stop everything with `docker compose down` (add `-v` to also drop the Postgres volume and start fresh next time).
+
+### Option B — Run natively on the host
+
+Useful for active development (hot reload via `tsx watch`). You still need a Postgres instance — the simplest way is to start just the `postgres` service from Docker Compose and run the app on the host against it:
+
+```bash
+docker compose up -d postgres
+```
+
+#### 1. Install dependencies
 
 ```bash
 npm install
 ```
 
-### 2. Configure environment variables
-
-Copy `.env.example` to `.env`:
+#### 2. Configure environment variables
 
 ```bash
 cp .env.example .env
 ```
 
-You need **two** Postgres connection strings — see why in the [Troubleshooting](#troubleshooting--known-local-dev-quirks) section below:
+The default `.env.example` value already points at the Docker Compose `postgres` service's exposed port (`localhost:5432`, matching credentials), so no editing is needed if you used the command above. If you're pointing at a different Postgres instance, just set `DATABASE_URL` to its standard `postgres://user:password@host:5432/dbname` connection string — one URL is all that's needed.
 
-- `DATABASE_URL` — used by the Prisma CLI (migrate/generate/studio)
-- `DIRECT_DATABASE_URL` — used by the running app itself, via `@prisma/adapter-pg`
-
-**Fastest option — local Prisma Postgres (no external install):**
-
-```bash
-npx prisma dev
-```
-
-This prints both connection strings directly — copy the `DATABASE_URL` (the `prisma+postgres://...` one) and the plain `postgres://...` TCP URL into `.env` as `DATABASE_URL` and `DIRECT_DATABASE_URL` respectively. Leave this command running in its own terminal.
-
-> On some Node versions this needs `NODE_OPTIONS=--experimental-sqlite npx prisma dev` — see Troubleshooting.
-
-**Alternative — any Postgres you already have** (Docker, a native install, etc.): just set both `DATABASE_URL` and `DIRECT_DATABASE_URL` to the same standard `postgres://user:password@host:5432/dbname` connection string. There's no proxy/direct distinction with a real Postgres server.
-
-### 3. Apply the database schema
+#### 3. Apply the database schema
 
 The migration is already committed, so just apply it:
 
@@ -143,7 +151,7 @@ npx prisma migrate deploy
 npx prisma generate
 ```
 
-### 4. Seed sample data
+#### 4. Seed sample data
 
 ```bash
 npm run seed
@@ -151,7 +159,7 @@ npm run seed
 
 This creates three users with deliberately different preferences (one fully opted in, one with SMS opted out, one opted into only in-app) and prints each user's `id` — copy one for the API examples below. Safe to re-run; it upserts by email.
 
-### 5. Run the server
+#### 5. Run the server
 
 ```bash
 npm run dev      # tsx watch — auto-restarts on file changes
@@ -166,6 +174,11 @@ The server listens on `http://localhost:3000` by default (`PORT` in `.env` to ch
 ```bash
 curl http://localhost:3000/health
 ```
+
+### Prerequisites (Option B only)
+
+- Node.js 20.19+ (developed against Node 22)
+- npm
 
 ## API Reference
 
@@ -288,24 +301,14 @@ DB-touching tests share the local dev database rather than a separate test insta
 
 ## Troubleshooting / Known Local-Dev Quirks
 
-This project's local database is `prisma dev`'s embedded Prisma Postgres emulator, not a full production-grade Postgres install. It's convenient (zero external services to install) but has a few rough edges worth knowing about up front:
-
-- **`No such built-in module: node:sqlite`** — on some Node versions, `prisma dev` needs the SQLite experimental flag:
-  ```bash
-  NODE_OPTIONS=--experimental-sqlite npx prisma dev
-  ```
-- **Two connection strings, not one** — `prisma dev` exposes a `prisma+postgres://...` proxy URL (for the CLI) and a separate plain `postgres://...` TCP URL (for the app's actual driver connection via `@prisma/adapter-pg`). Mixing them up produces a `Connection terminated unexpectedly` error rather than a clear "wrong URL" message.
-- **Occasional dropped connections** — under sustained use, this local instance can start failing queries with `Connection terminated unexpectedly`. It's a known issue with the embedded emulator, not the application. Fix: stop and restart it.
-  ```bash
-  npx prisma dev stop default
-  npx prisma dev
-  ```
-- **`prisma migrate dev` may fail with `P1017`** — this local setup has a reproducible issue with `migrate dev`'s temporary shadow database. Since the migration is already committed, you shouldn't need `migrate dev` for initial setup — use `npx prisma migrate deploy` instead (see [Local Setup](#local-setup)). If you do change `schema.prisma` yourself and need a new migration, and hit this, generate the SQL directly instead:
-  ```bash
-  npx prisma migrate diff --from-empty --to-schema ./prisma/schema.prisma --script > prisma/migrations/<timestamp>_<name>/migration.sql
-  npx prisma migrate deploy
-  ```
 - **Occasional `FAILED` results while manually testing** — this is intentional, not a bug. Each provider simulates a ~10% random failure rate outside the test environment, so the failure-path logging is actually exercised. It's disabled automatically for `npm test`.
+- **Port already in use (`3000` or `5432`)** — something else on your machine is bound to that port. Stop it, or override: `PORT=3001` in `.env` for the app, or change the left-hand side of the `ports:` mapping in `docker-compose.yml` for Postgres.
+
+### Why this project moved off `npx prisma dev`
+
+Earlier iterations of local setup used `npx prisma dev` — Prisma's embedded local Postgres emulator. It's convenient (zero external services to install) but turned out to have real, reproducible rough edges during development: it needed `NODE_OPTIONS=--experimental-sqlite` on some Node versions, exposed two different connection strings for CLI vs. app use (a common source of confusing `Connection terminated unexpectedly` errors), and its background WAL-streaming subsystem would periodically crash-loop under sustained use, degrading an otherwise-working session.
+
+None of this was an application bug — reproduced identically in a completely fresh clone with fresh `node_modules`. The actual fix was to stop working around a dev-only emulator and use a real `postgres:16` container instead (see [Local Setup](#local-setup)), which has none of these failure modes and also let the app collapse back down to a single `DATABASE_URL` (the two-URL split only existed because of `prisma dev`'s proxy). Kept here as a documented lesson rather than deleted, since diagnosing "is this an infra problem or a code problem" was itself a real part of building this.
 
 ## Class Diagram
 

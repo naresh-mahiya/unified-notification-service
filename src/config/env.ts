@@ -12,5 +12,4 @@ export const env = {
   port: Number(process.env.PORT ?? 3000),
   nodeEnv: process.env.NODE_ENV ?? "development",
   databaseUrl: required("DATABASE_URL"),
-  directDatabaseUrl: required("DIRECT_DATABASE_URL"),
 };
