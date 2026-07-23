@@ -1,6 +1,7 @@
 import { Channel, NotificationStatus } from "../../generated/prisma/enums.js";
 import type { ChannelProvider } from "../channels/channel.types.js";
 import type { UserWithPreferences } from "../users/user.repository.js";
+import type { LogAttemptInput } from "./notification.repository.js";
 import { AppError } from "../utils/app-error.js";
 
 export interface ChannelDispatchResult {
@@ -16,6 +17,7 @@ export interface DispatchResult {
 
 type GetUserWithPreferences = (userId: string) => Promise<UserWithPreferences | null>;
 type GetProvider = (channel: Channel) => ChannelProvider;
+type LogAttempt = (input: LogAttemptInput) => Promise<void>;
 
 const PREFERENCE_KEY_BY_CHANNEL: Record<Channel, keyof UserWithPreferences["preferences"]> = {
   [Channel.EMAIL]: "emailEnabled",
@@ -27,7 +29,8 @@ const PREFERENCE_KEY_BY_CHANNEL: Record<Channel, keyof UserWithPreferences["pref
 export class NotificationService {
   constructor(
     private readonly getUserWithPreferences: GetUserWithPreferences,
-    private readonly getProvider: GetProvider
+    private readonly getProvider: GetProvider,
+    private readonly logAttempt: LogAttempt
   ) {}
 
   async dispatch(
@@ -55,17 +58,36 @@ export class NotificationService {
     body: string
   ): Promise<ChannelDispatchResult> {
     const preferenceKey = PREFERENCE_KEY_BY_CHANNEL[channel];
-    if (!user.preferences[preferenceKey]) {
-      return { channel, status: NotificationStatus.SKIPPED };
-    }
 
+    const result = user.preferences[preferenceKey]
+      ? await this.send(user, channel, title, body)
+      : ({ channel, status: NotificationStatus.SKIPPED } as ChannelDispatchResult);
+
+    await this.logAttempt({
+      userId: user.id,
+      channel,
+      status: result.status,
+      title,
+      body,
+      ...(result.error ? { errorMessage: result.error } : {}),
+    });
+
+    return result;
+  }
+
+  private async send(
+    user: UserWithPreferences,
+    channel: Channel,
+    title: string,
+    body: string
+  ): Promise<ChannelDispatchResult> {
     try {
       const provider = this.getProvider(channel);
-      const result = await provider.send({ userId: user.id, title, body });
+      const deliveryResult = await provider.send({ userId: user.id, title, body });
 
-      if (!result.success) {
-        return result.error
-          ? { channel, status: NotificationStatus.FAILED, error: result.error }
+      if (!deliveryResult.success) {
+        return deliveryResult.error
+          ? { channel, status: NotificationStatus.FAILED, error: deliveryResult.error }
           : { channel, status: NotificationStatus.FAILED };
       }
 

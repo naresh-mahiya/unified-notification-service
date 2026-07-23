@@ -24,15 +24,21 @@ function successProvider(): ChannelProvider {
   return { send: vi.fn().mockResolvedValue({ success: true }) };
 }
 
+function fakeLogAttempt() {
+  return vi.fn().mockResolvedValue(undefined);
+}
+
 describe("NotificationService.dispatch", () => {
-  it("skips a channel the user has opted out of, without calling its provider", async () => {
+  it("skips a channel the user has opted out of, without calling its provider, and logs the skip", async () => {
     const user = fakeUser({ smsEnabled: false });
     const emailProvider = successProvider();
     const smsProvider = successProvider();
+    const logAttempt = fakeLogAttempt();
 
     const service = new NotificationService(
       async () => user,
-      (channel) => (channel === Channel.EMAIL ? emailProvider : smsProvider)
+      (channel) => (channel === Channel.EMAIL ? emailProvider : smsProvider),
+      logAttempt
     );
 
     const result = await service.dispatch(user.id, "Hi", "Body", [Channel.EMAIL, Channel.SMS]);
@@ -45,6 +51,13 @@ describe("NotificationService.dispatch", () => {
     );
     expect(smsProvider.send).not.toHaveBeenCalled();
     expect(emailProvider.send).toHaveBeenCalledTimes(1);
+
+    expect(logAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: user.id, channel: Channel.SMS, status: "SKIPPED" })
+    );
+    expect(logAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ userId: user.id, channel: Channel.EMAIL, status: "SUCCESS" })
+    );
   });
 
   it("dispatches to multiple opted-in channels independently", async () => {
@@ -57,7 +70,8 @@ describe("NotificationService.dispatch", () => {
 
     const service = new NotificationService(
       async () => user,
-      (channel) => providers[channel]!
+      (channel) => providers[channel]!,
+      fakeLogAttempt()
     );
 
     const result = await service.dispatch(user.id, "Hi", "Body", [
@@ -75,16 +89,18 @@ describe("NotificationService.dispatch", () => {
     );
   });
 
-  it("does not let one failing provider block the others", async () => {
+  it("does not let one failing provider block the others, and logs the failure with its error", async () => {
     const user = fakeUser();
     const failingEmailProvider: ChannelProvider = {
       send: vi.fn().mockRejectedValue(new Error("SMTP timeout")),
     };
     const workingPushProvider = successProvider();
+    const logAttempt = fakeLogAttempt();
 
     const service = new NotificationService(
       async () => user,
-      (channel) => (channel === Channel.EMAIL ? failingEmailProvider : workingPushProvider)
+      (channel) => (channel === Channel.EMAIL ? failingEmailProvider : workingPushProvider),
+      logAttempt
     );
 
     const result = await service.dispatch(user.id, "Hi", "Body", [Channel.EMAIL, Channel.PUSH]);
@@ -95,6 +111,10 @@ describe("NotificationService.dispatch", () => {
         { channel: Channel.PUSH, status: "SUCCESS" },
       ])
     );
+
+    expect(logAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: Channel.EMAIL, status: "FAILED", errorMessage: "SMTP timeout" })
+    );
   });
 
   it("records a FAILED result when a provider resolves with success: false", async () => {
@@ -102,10 +122,12 @@ describe("NotificationService.dispatch", () => {
     const rejectingProvider: ChannelProvider = {
       send: vi.fn().mockResolvedValue({ success: false, error: "invalid phone number" }),
     };
+    const logAttempt = fakeLogAttempt();
 
     const service = new NotificationService(
       async () => user,
-      () => rejectingProvider
+      () => rejectingProvider,
+      logAttempt
     );
 
     const result = await service.dispatch(user.id, "Hi", "Body", [Channel.SMS]);
@@ -113,23 +135,30 @@ describe("NotificationService.dispatch", () => {
     expect(result.results).toEqual([
       { channel: Channel.SMS, status: "FAILED", error: "invalid phone number" },
     ]);
+    expect(logAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ channel: Channel.SMS, status: "FAILED", errorMessage: "invalid phone number" })
+    );
   });
 
-  it("throws a 404 AppError when the user does not exist", async () => {
+  it("throws a 404 AppError when the user does not exist, without logging anything", async () => {
+    const logAttempt = fakeLogAttempt();
     const service = new NotificationService(
       async () => null,
-      () => successProvider()
+      () => successProvider(),
+      logAttempt
     );
 
     await expect(service.dispatch("missing-user", "Hi", "Body", [Channel.EMAIL])).rejects.toMatchObject({
       statusCode: 404,
     });
+    expect(logAttempt).not.toHaveBeenCalled();
   });
 
   it("throws an AppError instance specifically", async () => {
     const service = new NotificationService(
       async () => null,
-      () => successProvider()
+      () => successProvider(),
+      fakeLogAttempt()
     );
 
     await expect(service.dispatch("missing-user", "Hi", "Body", [Channel.EMAIL])).rejects.toBeInstanceOf(

@@ -20,6 +20,7 @@ describe("POST /api/notifications", () => {
   });
 
   afterAll(async () => {
+    await prisma.notificationLog.deleteMany({ where: { userId: testUserId } });
     await prisma.notificationPreference.deleteMany({ where: { userId: testUserId } });
     await prisma.user.delete({ where: { id: testUserId } });
   });
