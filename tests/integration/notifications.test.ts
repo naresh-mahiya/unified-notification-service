@@ -12,7 +12,7 @@ describe("POST /api/notifications", () => {
         name: "Test User",
         email: `test-user-${Date.now()}@example.com`,
         preference: {
-          create: { emailEnabled: true, smsEnabled: true, pushEnabled: true, inAppEnabled: true },
+          create: { emailEnabled: true, smsEnabled: false, pushEnabled: true, inAppEnabled: true },
         },
       },
     });
@@ -24,18 +24,22 @@ describe("POST /api/notifications", () => {
     await prisma.user.delete({ where: { id: testUserId } });
   });
 
-  it("accepts a valid payload for an existing user and echoes it back", async () => {
-    const payload = {
+  it("dispatches to opted-in channels and skips opted-out ones", async () => {
+    const res = await request(app).post("/api/notifications").send({
       userId: testUserId,
       title: "Welcome",
       body: "Thanks for signing up",
       channels: ["EMAIL", "SMS"],
-    };
-
-    const res = await request(app).post("/api/notifications").send(payload);
+    });
 
     expect(res.status).toBe(201);
-    expect(res.body).toEqual(payload);
+    expect(res.body).toEqual({
+      userId: testUserId,
+      results: expect.arrayContaining([
+        { channel: "EMAIL", status: "SUCCESS" },
+        { channel: "SMS", status: "SKIPPED" },
+      ]),
+    });
   });
 
   it("rejects a payload missing title", async () => {
